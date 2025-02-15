@@ -1,0 +1,18 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Jigsaw Eval",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "eval_matching.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--cfg=./experiments/jigsaw_4x4_128_512_250e_cosine_everyday.yaml"
+            ]
+        }
+    ]
+}

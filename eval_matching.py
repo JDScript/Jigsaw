@@ -39,6 +39,7 @@ def test_model(cfg):
         name=logger_name,
         id=logger_id,
         save_dir=model_save_path,
+        offline=True,
     )
 
     all_gpus = list(cfg.GPUS)
@@ -102,7 +103,7 @@ if __name__ == "__main__":
     full_log_name = f"eval_log_{file_suffix}"
 
     with DupStdoutFileManager(
-            os.path.join(cfg.OUTPUT_PATH, f"{full_log_name}.log")
+        os.path.join(cfg.OUTPUT_PATH, f"{full_log_name}.log")
     ) as _:
         print_easydict(cfg)
 

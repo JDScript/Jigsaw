@@ -1,6 +1,7 @@
 import numpy as np
 import open3d as o3d
 import torch
+import os
 
 from scipy.spatial.transform import Rotation as R
 import numpy as np
@@ -8,7 +9,21 @@ from .utils import lexico_iter
 from .global_alignment import global_alignment
 
 
-def estimate_global_transform(perm_mat, part_pcs, n_valid, n_pcs, n_critical_pcs, critical_pcs_idx, part_quat, part_trans, align_pivot=True):
+def estimate_global_transform(
+    perm_mat,
+    part_pcs,
+    n_valid,
+    n_pcs,
+    n_critical_pcs,
+    critical_pcs_idx,
+    part_quat,
+    part_trans,
+    align_pivot=True,
+    redundancy=0,
+    pfpp_matching_data_path=None,
+    data_id=None,
+    gt_pcs=None,
+):
     """
     Estimate global transformation based on the matching and points.
     Align to the largest piece if `align_pivot` is True.
@@ -17,12 +32,16 @@ def estimate_global_transform(perm_mat, part_pcs, n_valid, n_pcs, n_critical_pcs
     n_critical_pcs_cumsum = np.cumsum(n_critical_pcs, axis=-1)
     n_pcs_cumsum = np.cumsum(n_pcs, axis=-1)
     pred_dict = dict()
-    pred_dict['rot'] = np.zeros((B, P, 3, 3))
-    pred_dict['trans'] = np.zeros((B, P, 3))
+    pred_dict["rot"] = np.zeros((B, P, 3, 3))
+    pred_dict["trans"] = np.zeros((B, P, 3))
     for b in range(B):
         piece_connections = np.zeros(n_valid[b])
         sum_full_matched = np.sum(perm_mat[b])
         edges, transformations, uncertainty = [], [], []
+
+        corr_list = []
+        gt_pc_list = []
+        critical_pcs_idx_list = []
 
         # compute pairwise relative pose
         for idx1, idx2 in lexico_iter(np.arange(n_valid[b])):
@@ -53,15 +72,45 @@ def estimate_global_transform(perm_mat, part_pcs, n_valid, n_pcs, n_critical_pcs
                 continue
             pc1 = part_pcs[b, pc_st1:pc_ed1]  # N, 3
             pc2 = part_pcs[b, pc_st2:pc_ed2]  # N, 3
+
+            gt_pc1 = gt_pcs[b, pc_st1:pc_ed1]
+            gt_pc2 = gt_pcs[b, pc_st2:pc_ed2]
+
             if critical_pcs_idx is not None:
-                critical_pcs_src = pc1[critical_pcs_idx[b, pc_st1: pc_st1 + n1]]
-                critical_pcs_tgt = pc2[critical_pcs_idx[b, pc_st2: pc_st2 + n2]]
-                trans_mat = get_trans_from_mat(critical_pcs_src, critical_pcs_tgt, mat)
+                critical_pcs_idx_1 = critical_pcs_idx[b, pc_st1 : pc_st1 + n1]
+                critical_pcs_idx_2 = critical_pcs_idx[b, pc_st2 : pc_st2 + n2]
+
+                critical_pcs_src = pc1[critical_pcs_idx[b, pc_st1 : pc_st1 + n1]]
+                critical_pcs_tgt = pc2[critical_pcs_idx[b, pc_st2 : pc_st2 + n2]]
+                trans_mat, corr = get_trans_from_mat(
+                    critical_pcs_src, critical_pcs_tgt, mat
+                )
+
+                corr_list.append(corr)
+                gt_pc_list.append([gt_pc1, gt_pc2])
+                critical_pcs_idx_list.append([critical_pcs_idx_1, critical_pcs_idx_2])
+
                 edges.append(np.array([idx2, idx1]))
                 transformations.append(trans_mat)
                 uncertainty.append(1.0 / (mat_s))
                 piece_connections[idx1] = piece_connections[idx1] + 1
                 piece_connections[idx2] = piece_connections[idx2] + 1
+
+        # Save PuzzleFusion Matching Data
+        if pfpp_matching_data_path is not None:
+            data = {
+                "edges": edges,
+                "correspondence": corr_list,
+                "gt_pcs": gt_pcs[b],
+                "critical_pcs_idx": critical_pcs_idx[b],
+                "n_pcs": n_pcs[b],
+                "n_critical_pcs": n_critical_pcs[b],
+                "data_idx": data_id[b].cpu().numpy().item(),
+            }
+            save_path = os.path.join(
+                pfpp_matching_data_path, f"{data_id[b].cpu().numpy().item()}.npz"
+            )
+            np.savez(save_path, **data)
 
         # connect small pieces with less than 3 correspondence
         for idx1, idx2 in lexico_iter(np.arange(n_valid[b])):
@@ -87,9 +136,13 @@ def estimate_global_transform(perm_mat, part_pcs, n_valid, n_pcs, n_critical_pcs
                 pc1 = part_pcs[b, pc_st1:pc_ed1]
                 pc2 = part_pcs[b, pc_st2:pc_ed2]
                 if n2 > 0:
-                    trans_mat[:3, 3] = pc2[critical_pcs_idx[b, pc_st2]] - np.sum(pc1, axis=0)
+                    trans_mat[:3, 3] = pc2[critical_pcs_idx[b, pc_st2]] - np.sum(
+                        pc1, axis=0
+                    )
                 elif n1 > 0:
-                    trans_mat[:3, 3] = np.sum(pc2, axis=0) - pc1[critical_pcs_idx[b, pc_st1]]
+                    trans_mat[:3, 3] = (
+                        np.sum(pc2, axis=0) - pc1[critical_pcs_idx[b, pc_st1]]
+                    )
                 else:
                     trans_mat[:3, 3] = np.sum(pc2, axis=0) - np.sum(pc1, axis=0)
                 transformations.append(trans_mat)
@@ -108,37 +161,48 @@ def estimate_global_transform(perm_mat, part_pcs, n_valid, n_pcs, n_critical_pcs
             pc1 = part_pcs[b, pc_st1:pc_ed1]  # N, 3
             pc2 = part_pcs[b, pc_st2:pc_ed2]  # N, 3
             if critical_pcs_idx is not None:
-                critical_pcs_src = pc1[critical_pcs_idx[b, pc_st1: pc_st1 + n1]]
-                critical_pcs_tgt = pc2[critical_pcs_idx[b, pc_st2: pc_st2 + n2]]
+                critical_pcs_src = pc1[critical_pcs_idx[b, pc_st1 : pc_st1 + n1]]
+                critical_pcs_tgt = pc2[critical_pcs_idx[b, pc_st2 : pc_st2 + n2]]
                 trans_mat = np.eye(4)
                 matching1, matching2 = np.nonzero(mat)
-                trans_mat[:3, 3] = np.sum(critical_pcs_tgt[matching2], axis=0) - \
-                                    np.sum(critical_pcs_src[matching1], axis=0)
+                trans_mat[:3, 3] = np.sum(critical_pcs_tgt[matching2], axis=0) - np.sum(
+                    critical_pcs_src[matching1], axis=0
+                )
                 edges.append(np.array([idx2, idx1]))
                 transformations.append(trans_mat)
                 uncertainty.append(1)
                 piece_connections[idx1] = piece_connections[idx1] + 1
                 piece_connections[idx2] = piece_connections[idx2] + 1
-                
+
         if len(edges) > 0:
             edges = np.stack(edges)
             transformations = np.stack(transformations)
             uncertainty = np.array(uncertainty)
-            global_transformations = global_alignment(n_valid[b], edges, transformations, uncertainty)
+            global_transformations = global_alignment(
+                n_valid[b], edges, transformations, uncertainty
+            )
             pivot = 1
-            for idx in range(n_valid[b]):
+            for idx in range(n_valid[b] - redundancy[b]):
                 num_points = n_pcs[b, idx]
                 if num_points > n_pcs[b, pivot]:
                     pivot = idx
         else:
-            global_transformations = np.repeat(np.eye(4).reshape((1, 4, 4)), n_valid[b], axis=0)
+            global_transformations = np.repeat(
+                np.eye(4).reshape((1, 4, 4)), n_valid[b], axis=0
+            )
             pivot = 0
-        
-        if align_pivot:
-            global_transformations = align_to_pivot(global_transformations, part_quat[b], part_trans[b], n_valid[b], pivot=pivot)
 
-        pred_dict['rot'][b, :n_valid[b], :, :] = global_transformations[:, :3, :3]
-        pred_dict['trans'][b, :n_valid[b], :] = global_transformations[:, :3, 3]
+        if align_pivot:
+            global_transformations = align_to_pivot(
+                global_transformations,
+                part_quat[b],
+                part_trans[b],
+                n_valid[b],
+                pivot=pivot,
+            )
+
+        pred_dict["rot"][b, : n_valid[b], :, :] = global_transformations[:, :3, :3]
+        pred_dict["trans"][b, : n_valid[b], :] = global_transformations[:, :3, 3]
     return pred_dict
 
 
@@ -191,9 +255,7 @@ def run_ransac(xyz_i, xyz_j, corr_idx):
             False
         ),
         ransac_n=3,
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-            50000, 2500
-        ),
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 2500),
     )
 
     trans_mat = result_ransac.transformation
@@ -212,7 +274,7 @@ def get_corr_from_mat(mat):
 def get_trans_from_mat(pc_src, pc_tgt, mat):
     corr = get_corr_from_mat(mat)
     trans_mat = run_ransac(pc_src, pc_tgt, corr)
-    return trans_mat
+    return trans_mat, corr
 
 
 def get_trans_from_corr(pc_src, pc_tgt, corr):

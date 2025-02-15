@@ -18,7 +18,9 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
 
         self.num_classes = 2
         self.aff_feat_dim = self.cfg.MODEL.AFF_FEAT_DIM
-        assert self.aff_feat_dim % 2 == 0, "The affinity feature dimension must be even!"
+        assert (
+            self.aff_feat_dim % 2 == 0
+        ), "The affinity feature dimension must be even!"
         self.half_aff_feat_dim = self.aff_feat_dim // 2
 
         self.w_cls_loss = self.cfg.MODEL.LOSS.w_cls_loss
@@ -41,11 +43,15 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
         self.affinity_extractor = self._init_affinity_extractor()
 
         self.tf_self1 = PointTransformerLayer(
-            in_feat=self.pc_feat_dim, out_feat=self.pc_feat_dim,
-            n_heads=self.cfg.MODEL.TF_NUM_HEADS, nsampmle=self.cfg.MODEL.TF_NUM_SAMPLE,
+            in_feat=self.pc_feat_dim,
+            out_feat=self.pc_feat_dim,
+            n_heads=self.cfg.MODEL.TF_NUM_HEADS,
+            nsampmle=self.cfg.MODEL.TF_NUM_SAMPLE,
         )
-        self.tf_cross1 = CrossAttentionLayer(d_in=self.pc_feat_dim,
-                                             n_head=self.cfg.MODEL.TF_NUM_HEADS,)
+        self.tf_cross1 = CrossAttentionLayer(
+            d_in=self.pc_feat_dim,
+            n_head=self.cfg.MODEL.TF_NUM_HEADS,
+        )
         self.tf_layers = [("self", self.tf_self1), ("cross", self.tf_cross1)]
 
         if not self.cfg.MODEL.TEST_S_MASK:
@@ -71,20 +77,22 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
         return affinity_extractor
 
     def _init_classifier(self):
-        if self.pc_cls_method == 'binary':
+        if self.pc_cls_method == "binary":
             classifier = nn.Sequential(
                 nn.BatchNorm1d(self.pc_feat_dim),
                 nn.ReLU(inplace=True),
                 nn.Conv1d(self.pc_feat_dim, 1, 1),
             )
-        elif self.pc_cls_method == 'multi':
+        elif self.pc_cls_method == "multi":
             classifier = nn.Sequential(
                 nn.BatchNorm1d(self.pc_feat_dim),
                 nn.ReLU(inplace=True),
-                nn.Conv1d(self.pc_feat_dim, self.num_classes, 1)
+                nn.Conv1d(self.pc_feat_dim, self.num_classes, 1),
             )
         else:
-            raise NotImplementedError(f"{self.pc_cls_method} not implemented for classifier")
+            raise NotImplementedError(
+                f"{self.pc_cls_method} not implemented for classifier"
+            )
         return classifier
 
     def _init_affinity_layer(self):
@@ -107,7 +115,7 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
         return pc_feats
 
     def _get_critical_feats_BNF_from_label(
-            self, feat, n_critical_pcs_sum, critical_label, B, N_, F
+        self, feat, n_critical_pcs_sum, critical_label, B, N_, F
     ):
         critical_feats = torch.zeros(B, N_, F, device=self.device, dtype=feat.dtype)
         for b in range(B):
@@ -161,17 +169,29 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
             data_dict.update({"part_feats": part_feats})
         out_dict = dict()
         feat = part_feats.transpose(1, 2)
-        if self.pc_cls_method == 'binary':
+        if self.pc_cls_method == "binary":
             cls_logits = self.pc_classifier(feat)
             cls_logits = cls_logits.transpose(1, 2)
             cls_pred = torch.sigmoid(cls_logits.detach())
             cls_pred = (cls_pred > 0.5).to(torch.int64)
             cls_pred = cls_pred.reshape(B, N_sum)
+
+            if torch.sum(cls_pred) == 0:
+                # if no fracture points are found, we use the prediction as the label
+                # random choose one point as the fracture point
+                rand_idx = torch.randint(0, N_sum, (B,))
+                rand_b = torch.randint(0, B, (1,))
+                cls_logits[rand_b, rand_idx, 0] = 1.0
+                cls_pred[rand_b, rand_idx] = True
         else:
             cls_logits = self.pc_classifier(feat)
             cls_logits = fun.log_softmax(cls_logits, dim=1)
             cls_logits = cls_logits.permute(0, 2, 1).contiguous()
-            cls_pred = torch.argmax(cls_logits.reshape(-1, self.num_classes), dim=-1).detach().reshape(B, N_sum)
+            cls_pred = (
+                torch.argmax(cls_logits.reshape(-1, self.num_classes), dim=-1)
+                .detach()
+                .reshape(B, N_sum)
+            )
         out_dict.update(
             {
                 "cls_logits": cls_logits,  # [B, N_sum, 1] or [B, N_sum, 2]
@@ -226,6 +246,8 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
         n_critical_pcs_sum = torch.sum(n_critical_pcs, dim=-1)  # [B]
         N_ = torch.max(n_critical_pcs_sum)
 
+        assert N_ > 0, "No critical points found in the input data."
+
         critical_feats = self._get_critical_feats_BNF_from_label(
             part_feats, n_critical_pcs_sum, critical_label, B, N_, F
         )
@@ -239,7 +261,7 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
                     affinity_feat[:, :, : self.half_aff_feat_dim], p=2, dim=-1
                 ),
                 fun.normalize(
-                    affinity_feat[:, :, self.half_aff_feat_dim:], p=2, dim=-1
+                    affinity_feat[:, :, self.half_aff_feat_dim :], p=2, dim=-1
                 ),
             ],
             dim=-1,
@@ -295,9 +317,11 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
 
         # first calc segmentation
         cls_gt = critical_label.reshape(-1)
-        if self.pc_cls_method == 'binary':
+        if self.pc_cls_method == "binary":
             cls_logits = cls_logits.reshape(-1)
-            cls_loss = fun.binary_cross_entropy_with_logits(cls_logits, cls_gt.to(torch.float32))
+            cls_loss = fun.binary_cross_entropy_with_logits(
+                cls_logits, cls_gt.to(torch.float32)
+            )
         else:
             cls_logits = cls_logits.reshape(-1, self.num_classes)
             cls_loss = fun.nll_loss(cls_logits, cls_gt)
@@ -333,7 +357,9 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
             gt_critical_pcs = self._get_critical_feats_BNF_from_label(
                 gt_pcs, n_critical_pcs_sum, critical_label, B, N_, 3
             )  # [B, N_, 3]
-            gt_critical_pcs_dist = square_distance(gt_critical_pcs, gt_critical_pcs)  # [B, N_, N_]
+            gt_critical_pcs_dist = square_distance(
+                gt_critical_pcs, gt_critical_pcs
+            )  # [B, N_, N_]
             mask = out_dict.get("s_mask", None)
             neg_mask = out_dict.get("s_neg_mask", None)
             if neg_mask is None:
@@ -385,9 +411,9 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
 
         if self.training:
             loss = (
-                    self.w_cls_loss * cls_loss
-                    + self.w_mat_loss * mat_loss
-                    + self.w_rig_loss * rig_loss
+                self.w_cls_loss * cls_loss
+                + self.w_mat_loss * mat_loss
+                + self.w_rig_loss * rig_loss
             )
         else:
             loss = cls_loss + mat_loss
@@ -425,14 +451,10 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
     def training_epoch_end(self, outputs):
         if self.w_mat_loss == 0 and self.current_epoch >= self.cfg.MODEL.LOSS.mat_epoch:
             self.w_mat_loss = 1.0
-            print(
-                f"current_epoch={self.current_epoch}, self.w_mat_los = 1.0"
-            )
+            print(f"current_epoch={self.current_epoch}, self.w_mat_los = 1.0")
         if self.w_rig_loss == 0 and self.current_epoch >= self.cfg.MODEL.LOSS.rig_epoch:
             self.w_rig_loss = 1.0
-            print(
-                f"current_epoch={self.current_epoch}, self.w_rig_loss = 1.0"
-            )
+            print(f"current_epoch={self.current_epoch}, self.w_rig_loss = 1.0")
 
     @torch.no_grad()
     def compute_label(self, part_pcs, nps, n_valid, label_thresholds):
@@ -457,7 +479,7 @@ class JointSegmentationAlignmentModel(MatchingBaseModel):
 
     @torch.no_grad()
     def diagonal_square_mask(
-            self, shape, n_pcs, n_part=None, pos_msk=0.0, neg_msk=1000.0
+        self, shape, n_pcs, n_part=None, pos_msk=0.0, neg_msk=1000.0
     ):
         """
         generate a mask which diagonal matrices are neg_msk and others pos_mask

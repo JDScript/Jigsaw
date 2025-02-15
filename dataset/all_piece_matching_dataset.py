@@ -1,6 +1,7 @@
 import os
 import pickle
 import random
+import h5py
 
 import numpy as np
 import trimesh
@@ -16,36 +17,46 @@ class AllPieceMatchingDataset(Dataset):
     """
 
     def __init__(
-            self,
-            data_dir,
-            data_fn,
-            data_keys,
-            category="",
-            num_points=1000,
-            min_num_part=2,
-            max_num_part=20,
-            shuffle_parts=False,
-            rot_range=-1,
-            overfit=-1,
-            length=-1,
-
-            sample_by="area",
-            min_part_point=30,
-            fracture_label_threshold=0.025,
+        self,
+        data_dir,
+        data_fn,
+        data_keys,
+        category="all",
+        num_points=1000,
+        min_num_part=2,
+        max_num_part=20,
+        shuffle_parts=False,
+        rot_range=-1,
+        overfit=10,
+        length=-1,
+        sample_by="area",
+        min_part_point=30,
+        fracture_label_threshold=0.025,
+        removal_meta_file="/home/duan/shl/JZY/breaking_bad_vol.hdf5",
+        num_removal=0,
+        num_redundancy=0,
     ):
+        assert not (
+            num_removal > 0 and num_redundancy > 0
+        ), "Cannot do both removal and redundancy"
         # store parameters
         self.category = category if category.lower() != "all" else ""
         self.data_dir = data_dir
         self.num_points = num_points
         self.min_num_part = min_num_part
         self.max_num_part = max_num_part  # ignore shapes with more parts
-        self.min_part_point = min_part_point  # ensure that each piece has at least # points
+        self.min_part_point = (
+            min_part_point  # ensure that each piece has at least # points
+        )
         self.shuffle_parts = shuffle_parts  # shuffle part orders
         self.rot_range = rot_range  # rotation range in degree
 
         self.sample_by = sample_by
         # ['point', 'area'] sample by fixed point number or mesh area, we only support 'area' now.
         # list of fracture folder path
+        self.removal_meta_file = removal_meta_file
+        self.num_removal = int(num_removal)
+        self.num_redundancy = int(num_redundancy)
         self.data_list = self._read_data(data_fn)
 
         print("dataset length: ", len(self.data_list))
@@ -73,18 +84,25 @@ class AllPieceMatchingDataset(Dataset):
     def _read_data(self, data_fn):
         """Filter out invalid number of parts and generate data_list."""
         # Load pre-generated data_list if exists.
-        pre_compute_file_name = f"all_piece_matching_metadata_{self.min_num_part}_{self.max_num_part}_" + data_fn
-        if os.path.exists(os.path.join(self.data_dir, pre_compute_file_name)):
-            with open(os.path.join(self.data_dir, pre_compute_file_name), "rb") as meta_table:
-                meta_dict = pickle.load(meta_table)
-                data_list = meta_dict["data_list"]
-            return data_list
+        # pre_compute_file_name = (
+        #     f"all_piece_matching_metadata_{self.min_num_part+self.num_removal}_{self.max_num_part}_"
+        #     + data_fn
+        # )
+        # if os.path.exists(os.path.join(self.data_dir, pre_compute_file_name)):
+        #     with open(
+        #         os.path.join(self.data_dir, pre_compute_file_name), "rb"
+        #     ) as meta_table:
+        #         meta_dict = pickle.load(meta_table)
+        #         data_list = meta_dict["data_list"]
+        #     return data_list
 
-        print("start generate data_list")
+        # print("start generate data_list")
         with open(os.path.join(self.data_dir, data_fn), "r") as f:
             mesh_list = [line.strip() for line in f.readlines()]
             if self.category:
-                mesh_list = [line for line in mesh_list if self.category in line.split("/")]
+                mesh_list = [
+                    line for line in mesh_list if self.category in line.split("/")
+                ]
         data_list = []
         for mesh in mesh_list:
             mesh_dir = os.path.join(self.data_dir, mesh)
@@ -100,14 +118,26 @@ class AllPieceMatchingDataset(Dataset):
                 frac = os.path.join(mesh, frac)
                 pieces = os.listdir(os.path.join(self.data_dir, frac))
                 pieces.sort()
-                if self.min_num_part <= len(pieces) <= self.max_num_part:
+                # Here's the limit
+                # For removal, we need to ensure that, after removal, number of parts should still greater than min_parts
+                # For redundancy, we need to ensure that,
+                # 1. after redundancy, number of parts should still less than max_parts
+                # 2. num of redundancy should not exceed num of parts
+                if (
+                    self.min_num_part + self.num_removal
+                    <= len(pieces)
+                    <= self.max_num_part - self.num_redundancy
+                    and len(pieces) > self.num_redundancy
+                ):
                     data_list.append(frac)
         print("finish generation, start saving")
         meta_dict = {
             "data_list": data_list,
         }
-        with open(os.path.join(self.data_dir, pre_compute_file_name), "wb") as meta_table:
-            pickle.dump(meta_dict, meta_table, protocol=pickle.HIGHEST_PROTOCOL)
+        # with open(
+        #     os.path.join(self.data_dir, pre_compute_file_name), "wb"
+        # ) as meta_table:
+        #     pickle.dump(meta_dict, meta_table, protocol=pickle.HIGHEST_PROTOCOL)
         return data_list
 
     @staticmethod
@@ -165,7 +195,7 @@ class AllPieceMatchingDataset(Dataset):
         return np.array(nps, dtype=np.int64)
 
     def sample_reweighted_points_by_areas(self, areas):
-        """ Sample points by areas, but ensures that each part has at least # points.
+        """Sample points by areas, but ensures that each part has at least # points.
         areas: [P]
         """
         nps = self.sample_points_by_areas(areas, self.num_points)
@@ -188,20 +218,64 @@ class AllPieceMatchingDataset(Dataset):
         # This implementation is not very elegant, could improve by resample by areas.
         return np.array(nps, dtype=np.int64)
 
-    def _get_pcs(self, data_folder):
+    def _get_pcs(self, data_name):
         """Read mesh and sample point cloud from a folder."""
         # `piece`: xxx/plate/1d4093ad2dfad9df24be2e4f911ee4af/fractured_0/piece_0.obj
-        data_folder = os.path.join(self.data_dir, data_folder)
+        data_folder = os.path.join(self.data_dir, data_name)
         mesh_files = os.listdir(data_folder)
         mesh_files.sort()
-        if not self.min_num_part <= len(mesh_files) <= self.max_num_part:
+        if not (
+            (self.min_num_part + self.num_removal)
+            <= len(mesh_files)
+            <= self.max_num_part
+        ):
             raise ValueError
+
+        # read removal & redundant meta data
+
+        removal_pieces = []
+        redundant_pieces = []
+        redundant_meshes = []
+        with h5py.File(self.removal_meta_file, "r") as f:
+            if self.num_removal > 0:
+                removal_pieces_names = np.array(
+                    [name.decode("utf-8") for name in f[data_name]["pieces_names"][:]]
+                )
+                removal_order = np.array(f[data_name]["removal_order"][:])
+                removal_pieces = set(
+                    removal_pieces_names[removal_order[: self.num_removal]]
+                )
+                original_num_parts = len(mesh_files)
+                # remove pieces from mesh_files
+                mesh_files = list(
+                    filter(lambda x: x.split(".")[0] not in removal_pieces, mesh_files)
+                )
+                removal_pieces = list(removal_pieces)
+                assert len(mesh_files) == original_num_parts - self.num_removal
+
+            if self.num_redundancy > 0:
+                redundant_pieces = f[data_name]["redundant_pieces"][
+                    : self.num_redundancy
+                ]
+                redundant_pieces = [
+                    f"{p[0].decode('utf-8')}/pieces/{p[1].decode('utf-8')}"
+                    for p in redundant_pieces
+                ]
+                redundant_meshes = [
+                    trimesh.Trimesh(
+                        vertices=np.array(f[p]["vertices"][:]),
+                        faces=np.array(f[p]["faces"][:]),
+                    )
+                    for p in redundant_pieces
+                ]
+            f.close()
 
         # read mesh and sample points
         meshes = [
             trimesh.load(os.path.join(data_folder, mesh_file), force="mesh")
             for mesh_file in mesh_files
         ]
+        meshes.extend(redundant_meshes)
         areas = [mesh.area for mesh in meshes]
         areas = np.array(areas)
         pcs, piece_id, nps = [], [], []
@@ -217,10 +291,12 @@ class AllPieceMatchingDataset(Dataset):
             piece_id.append([i] * num_points)
 
         piece_id = np.concatenate(piece_id).astype(np.int64).reshape((-1, 1))
-        return pcs, piece_id, nps, areas
+        return pcs, piece_id, nps, areas, removal_pieces, redundant_pieces
 
     def __getitem__(self, index):
-        pcs, piece_id, nps, areas = self._get_pcs(self.data_list[index])
+        pcs, piece_id, nps, areas, removal_pieces, redundant_pieces = self._get_pcs(
+            self.data_list[index]
+        )
         num_parts = len(pcs)
         cur_pts, cur_quat, cur_trans, cur_pts_gt = [], [], [], []
         for i, (pc, n_p) in enumerate(zip(pcs, nps)):
@@ -236,15 +312,23 @@ class AllPieceMatchingDataset(Dataset):
 
         cur_pts = np.concatenate(cur_pts).astype(np.float32)  # [N_sum, 3]
         cur_pts_gt = np.concatenate(cur_pts_gt).astype(np.float32)  # [N_sum, 3]
-        cur_quat = self._pad_data(np.stack(cur_quat, axis=0), self.max_num_part).astype(np.float32)  # [P, 4]
-        cur_trans = self._pad_data(np.stack(cur_trans, axis=0), self.max_num_part).astype(np.float32)  # [P, 3]
+        cur_quat = self._pad_data(np.stack(cur_quat, axis=0), self.max_num_part).astype(
+            np.float32
+        )  # [P, 4]
+        cur_trans = self._pad_data(
+            np.stack(cur_trans, axis=0), self.max_num_part
+        ).astype(
+            np.float32
+        )  # [P, 3]
         n_pcs = self._pad_data(np.array(nps), self.max_num_part).astype(np.int64)  # [P]
         valids = np.zeros(self.max_num_part, dtype=np.float32)
         valids[:num_parts] = 1.0
         # soft threshold, parameter not tuned.
         # threshold = 1 / np.sqrt(self.num_points)
         # label_thresholds = 2 * threshold * np.sqrt(areas)[piece_id[:, 0]]
-        label_thresholds = np.ones([self.num_points], dtype=np.float32) * self.fracture_label_threshold  # [N_sum]
+        label_thresholds = (
+            np.ones([self.num_points], dtype=np.float32) * self.fracture_label_threshold
+        )  # [N_sum]
         """
         data_dict = {
             'part_pcs', 'gt_pcs': [P, N, 3], or [N_sum, 3], The points sampled from each part.
@@ -257,6 +341,7 @@ class AllPieceMatchingDataset(Dataset):
         }
         """
         data_dict = {
+            "name": self.data_list[index],
             "part_pcs": cur_pts,
             "gt_pcs": cur_pts_gt,
             "part_valids": valids,
@@ -265,6 +350,11 @@ class AllPieceMatchingDataset(Dataset):
             "n_pcs": n_pcs,
             "data_id": index,
             "critical_label_thresholds": label_thresholds,
+            "num_parts": num_parts,
+            "removal": self.num_removal,
+            "redundancy": self.num_redundancy,
+            "removal_pieces": ",".join(removal_pieces),
+            "redundant_pieces": ",".join(redundant_pieces),
         }
         return data_dict
 
@@ -285,6 +375,8 @@ def build_all_piece_matching_dataloader(cfg):
         min_part_point=cfg.DATA.MIN_PART_POINT,
         length=cfg.DATA.LENGTH * cfg.BATCH_SIZE,
         fracture_label_threshold=cfg.DATA.FRACTURE_LABEL_THRESHOLD,
+        num_removal=cfg.DATA.NUM_REMOVAL,
+        num_redundancy=cfg.DATA.NUM_REDUNDANCY,
     )
     train_set = AllPieceMatchingDataset(**data_dict)
     train_loader = DataLoader(

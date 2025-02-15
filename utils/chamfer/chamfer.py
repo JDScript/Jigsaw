@@ -1,4 +1,4 @@
-import chamfer_cuda
+# import chamfer_cuda
 import torch
 from torch.cuda.amp import custom_fwd, custom_bwd
 
@@ -28,7 +28,8 @@ class ChamferDistanceFunction(torch.autograd.Function):
         grad_dist2 = grad_dist2.contiguous()
         assert grad_dist1.is_cuda and grad_dist2.is_cuda, "Only support cuda currently."
         grad_xyz1, grad_xyz2 = chamfer_cuda.chamfer_backward(
-            grad_dist1, grad_dist2, xyz1, xyz2, idx1, idx2)
+            grad_dist1, grad_dist2, xyz1, xyz2, idx1, idx2
+        )
         return grad_xyz1, grad_xyz2
 
 
@@ -77,8 +78,8 @@ def nn_distance(xyz1, xyz2, transpose=True):
 
 
 class ChamferDistanceL2(torch.nn.Module):
-    f''' Chamder Distance L2
-    '''
+    f""" Chamder Distance L2
+    """
 
     def __init__(self, ignore_zeros=False):
         super().__init__()
